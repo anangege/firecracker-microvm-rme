@@ -5,6 +5,7 @@ use std::convert::Infallible;
 
 use kvm_ioctls::Kvm as KvmFd;
 
+use super::realm::KVM_CAP_ARM_RME;
 use crate::cpu_config::templates::KvmCapability;
 
 /// ['Kvm'] initialization can't fail for Aarch64
@@ -15,6 +16,8 @@ pub type KvmArchError = Infallible;
 pub struct OptionalCapabilities {
     /// KVM_CAP_COUNTER_OFFSET
     pub counter_offset: bool,
+    /// KVM_CAP_ARM_RME — ARM Realm Management Extension support
+    pub rme: bool,
 }
 
 /// Struct with kvm fd and kvm associated parameters.
@@ -55,6 +58,7 @@ impl Kvm {
                 .fd
                 .check_extension_raw(kvm_bindings::KVM_CAP_COUNTER_OFFSET.into())
                 != 0,
+            rme: self.fd.check_extension_raw(u64::from(KVM_CAP_ARM_RME)) != 0,
         }
     }
 }

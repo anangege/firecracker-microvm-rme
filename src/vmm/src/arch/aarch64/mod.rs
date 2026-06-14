@@ -9,6 +9,8 @@ pub mod gic;
 pub mod kvm;
 /// Layout for this aarch64 system.
 pub mod layout;
+/// ARM CCA RME (Realm Management Extension) support for confidential VMs.
+pub mod realm;
 /// Logic for configuring aarch64 registers.
 pub mod regs;
 /// Architecture specific vCPU code
