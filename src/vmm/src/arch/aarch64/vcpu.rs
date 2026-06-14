@@ -18,6 +18,7 @@ use super::get_fdt_addr;
 use super::regs::*;
 use crate::arch::EntryPoint;
 use crate::arch::aarch64::kvm::OptionalCapabilities;
+use crate::arch::aarch64::realm::KVM_ARM_VCPU_REC;
 use crate::arch::aarch64::regs::{Aarch64RegisterVec, KVM_REG_ARM64_SVE_VLS};
 use crate::cpu_config::aarch64::custom_cpu_template::VcpuFeatures;
 use crate::cpu_config::templates::CpuConfiguration;
@@ -117,6 +118,8 @@ pub struct KvmVcpu {
     kvi: kvm_vcpu_init,
     /// IPA of steal_time region
     pub pvtime_ipa: Option<GuestAddress>,
+    /// Whether this vCPU is a Realm Execution Context (ARM CCA RME).
+    is_rec: bool,
 }
 
 /// Vcpu peripherals
@@ -128,6 +131,9 @@ pub struct Peripherals {
 
 impl KvmVcpu {
     /// Constructs a new kvm vcpu with arch specific functionality.
+    ///
+    /// For Realm VMs (ARM CCA RME), the vCPU is initialized as a Realm Execution
+    /// Context (REC) with restricted register access.
     ///
     /// # Arguments
     ///
@@ -145,13 +151,24 @@ impl KvmVcpu {
             kvi.features[0] |= 1 << KVM_ARM_VCPU_POWER_OFF;
         }
 
+        let is_rec = vm.is_realm();
+        if is_rec {
+            kvi.features[0] |= 1 << KVM_ARM_VCPU_REC;
+        }
+
         Ok(KvmVcpu {
             index,
             fd: kvm_vcpu,
             peripherals: Default::default(),
             kvi,
             pvtime_ipa: None,
+            is_rec,
         })
+    }
+
+    /// Returns `true` if this vCPU is a Realm Execution Context.
+    pub fn is_rec(&self) -> bool {
+        self.is_rec
     }
 
     /// Read the MPIDR - Multiprocessor Affinity Register.
@@ -230,14 +247,20 @@ impl KvmVcpu {
     }
 
     /// Save the KVM internal state.
+    ///
+    /// For REC vCPUs, full register enumeration is skipped because realm vCPUs
+    /// do not expose most registers to the hypervisor.
     pub fn save_state(&self) -> Result<VcpuState, KvmVcpuError> {
         let mut state = VcpuState {
             mp_state: self.get_mpstate().map_err(KvmVcpuError::SaveState)?,
             ..Default::default()
         };
-        self.get_all_registers(&mut state.regs)
-            .map_err(KvmVcpuError::SaveState)?;
-        state.mpidr = self.get_mpidr().map_err(KvmVcpuError::SaveState)?;
+
+        if !self.is_rec {
+            self.get_all_registers(&mut state.regs)
+                .map_err(KvmVcpuError::SaveState)?;
+            state.mpidr = self.get_mpidr().map_err(KvmVcpuError::SaveState)?;
+        }
 
         state.kvi = self.kvi;
         // We don't save power off state in a snapshot, because
@@ -315,8 +338,7 @@ impl KvmVcpu {
         Ok(())
     }
 
-    /// Checks for SVE feature and calls `vcpu_finalize` if
-    /// it is enabled.
+    /// Finalizes vCPU features that require explicit finalization (SVE, REC).
     fn finalize_vcpu(&self) -> Result<(), KvmVcpuError> {
         if (self.kvi.features[0] & (1 << KVM_ARM_VCPU_SVE)) != 0 {
             // KVM_ARM_VCPU_SVE has value 4 so casting to i32 is safe.
@@ -324,10 +346,22 @@ impl KvmVcpu {
             let feature = KVM_ARM_VCPU_SVE as i32;
             self.fd.vcpu_finalize(&feature).unwrap();
         }
+
+        if self.is_rec {
+            #[allow(clippy::cast_possible_wrap)]
+            let feature = KVM_ARM_VCPU_REC as i32;
+            self.fd
+                .vcpu_finalize(&feature)
+                .map_err(KvmVcpuError::Init)?;
+        }
+
         Ok(())
     }
 
     /// Configure relevant boot registers for a given vCPU.
+    ///
+    /// For Realm Execution Context (REC) vCPUs, only PC and x0 are set —
+    /// PSTATE is managed by the realm firmware, and timer/CLIDR access is restricted.
     ///
     /// # Arguments
     ///
@@ -343,14 +377,16 @@ impl KvmVcpu {
     ) -> Result<(), VcpuArchError> {
         let kreg_off = offset_of!(kvm_regs, regs);
 
-        // Get the register index of the PSTATE (Processor State) register.
-        let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
-        let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
-        self.fd
-            .set_one_reg(id, &PSTATE_FAULT_BITS_64.to_le_bytes())
-            .map_err(|err| {
-                VcpuArchError::SetOneReg(id, format!("{PSTATE_FAULT_BITS_64:#x}"), err)
-            })?;
+        if !self.is_rec {
+            // Get the register index of the PSTATE (Processor State) register.
+            let pstate = offset_of!(user_pt_regs, pstate) + kreg_off;
+            let id = arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate);
+            self.fd
+                .set_one_reg(id, &PSTATE_FAULT_BITS_64.to_le_bytes())
+                .map_err(|err| {
+                    VcpuArchError::SetOneReg(id, format!("{PSTATE_FAULT_BITS_64:#x}"), err)
+                })?;
+        }
 
         // Other vCPUs are powered off initially awaiting PSCI wakeup.
         if self.index == 0 {
@@ -372,23 +408,30 @@ impl KvmVcpu {
                 .set_one_reg(id, &fdt_addr.to_le_bytes())
                 .map_err(|err| VcpuArchError::SetOneReg(id, format!("{fdt_addr:#x}"), err))?;
 
-            // Reset the physical counter for the guest. This way we avoid guest reading
-            // host physical counter.
-            // Resetting KVM_REG_ARM_PTIMER_CNT for single vcpu is enough because there is only
-            // one timer struct with offsets per VM.
-            // Because the access to KVM_REG_ARM_PTIMER_CNT is only present starting 6.4 kernel,
-            // we only do the reset if KVM_CAP_COUNTER_OFFSET is present as it was added
-            // in the same patch series as the ability to set the KVM_REG_ARM_PTIMER_CNT register.
-            // Path series which introduced the needed changes:
-            // https://lore.kernel.org/all/20230330174800.2677007-1-maz@kernel.org/
-            // Note: the value observed by the guest will still be above 0, because there is a delta
-            // time between this resetting and first call to KVM_RUN.
-            if optional_capabilities.counter_offset {
-                self.fd
-                    .set_one_reg(KVM_REG_ARM_PTIMER_CNT, &[0; 8])
-                    .map_err(|err| {
-                        VcpuArchError::SetOneReg(id, format!("{KVM_REG_ARM_PTIMER_CNT:#x}"), err)
-                    })?;
+            if !self.is_rec {
+                // Reset the physical counter for the guest. This way we avoid guest reading
+                // host physical counter.
+                // Resetting KVM_REG_ARM_PTIMER_CNT for single vcpu is enough because there is only
+                // one timer struct with offsets per VM.
+                // Because the access to KVM_REG_ARM_PTIMER_CNT is only present starting 6.4
+                // kernel, we only do the reset if KVM_CAP_COUNTER_OFFSET is present as it was
+                // added in the same patch series as the ability to set the
+                // KVM_REG_ARM_PTIMER_CNT register.
+                // Path series which introduced the needed changes:
+                // https://lore.kernel.org/all/20230330174800.2677007-1-maz@kernel.org/
+                // Note: the value observed by the guest will still be above 0, because there is a
+                // delta time between this resetting and first call to KVM_RUN.
+                if optional_capabilities.counter_offset {
+                    self.fd
+                        .set_one_reg(KVM_REG_ARM_PTIMER_CNT, &[0; 8])
+                        .map_err(|err| {
+                            VcpuArchError::SetOneReg(
+                                id,
+                                format!("{KVM_REG_ARM_PTIMER_CNT:#x}"),
+                                err,
+                            )
+                        })?;
+                }
             }
         }
         Ok(())
