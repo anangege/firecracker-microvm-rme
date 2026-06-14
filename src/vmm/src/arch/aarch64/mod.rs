@@ -59,6 +59,10 @@ pub enum ConfigurationError {
     VcpuConfigure(#[from] KvmVcpuError),
     /// Failed to read host cache information: {0}
     CacheInfo(#[from] cache_info::CacheInfoError),
+    /// Cannot copy firmware file fd: {0}
+    FirmwareFile(std::io::Error),
+    /// Cannot load firmware into guest memory: {0}
+    FirmwareLoad(std::io::Error),
 }
 
 /// Returns a Vec of the valid memory addresses for aarch64.
@@ -92,6 +96,9 @@ pub fn arch_memory_regions(size: usize) -> Vec<(GuestAddress, usize)> {
 }
 
 /// Configures the system for booting Linux.
+///
+/// When `realm` is true, certain host-specific overrides (CLIDR) are skipped
+/// and the FDT is generated without non-deterministic elements for CCA RME measurement.
 #[allow(clippy::too_many_arguments)]
 pub fn configure_system_for_boot(
     kvm: &Kvm,
@@ -103,6 +110,7 @@ pub fn configure_system_for_boot(
     entry_point: EntryPoint,
     initrd: &Option<InitrdConfig>,
     boot_cmdline: Cmdline,
+    realm: bool,
 ) -> Result<(), ConfigurationError> {
     // Construct the base CpuConfiguration to apply CPU template onto.
     let cpu_config = CpuConfiguration::new(cpu_template, vcpus)?;
@@ -127,9 +135,13 @@ pub fn configure_system_for_boot(
         )?;
     }
 
-    // Override CLIDR_EL1 ctype/LoC fields on each vCPU to match the host's
-    // real cache topology. See `override_clidr` for details.
-    override_clidr(vcpus)?;
+    // Skip CLIDR override for realm VMs: the vCPU register state is managed by the
+    // RMM and host-specific cache topology overrides are not applicable.
+    if !realm {
+        // Override CLIDR_EL1 ctype/LoC fields on each vCPU to match the host's
+        // real cache topology. See `override_clidr` for details.
+        override_clidr(vcpus)?;
+    }
 
     let vcpu_mpidr = vcpus
         .iter_mut()
@@ -147,6 +159,7 @@ pub fn configure_system_for_boot(
         device_manager,
         vm.get_irqchip(),
         initrd,
+        realm,
     )?;
 
     let fdt_address = GuestAddress(get_fdt_addr(vm.guest_memory()));
@@ -277,6 +290,43 @@ pub fn load_kernel(
         entry_addr: entry_addr.kernel_load,
         protocol: BootProtocol::LinuxBoot,
     })
+}
+
+/// Load a raw binary firmware image into guest memory at the specified address.
+///
+/// Returns the address and size of the loaded firmware region.
+/// Used for loading TF-A firmware into RAM for ARM CCA RME realm VMs.
+pub fn load_firmware(
+    firmware: &File,
+    guest_memory: &GuestMemoryMmap,
+    load_address: GuestAddress,
+) -> Result<(GuestAddress, usize), ConfigurationError> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut firmware_file = firmware
+        .try_clone()
+        .map_err(ConfigurationError::FirmwareFile)?;
+
+    let size = firmware_file
+        .metadata()
+        .map_err(ConfigurationError::FirmwareLoad)?
+        .size() as usize;
+
+    if size == 0 {
+        return Ok((load_address, 0));
+    }
+
+    let mut buf = vec![0u8; size];
+    firmware_file
+        .read_exact(&mut buf)
+        .map_err(ConfigurationError::FirmwareLoad)?;
+
+    guest_memory
+        .write_slice(&buf, load_address)
+        .map_err(ConfigurationError::MemoryError)?;
+
+    Ok((load_address, size))
 }
 
 #[cfg(kani)]

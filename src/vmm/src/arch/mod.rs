@@ -22,7 +22,7 @@ pub use aarch64::vm::{KvmVm, KvmVmError, VmState};
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
     ConfigurationError, arch_memory_regions, configure_system_for_boot, get_kernel_start,
-    initrd_load_addr, layout::*, load_kernel,
+    initrd_load_addr, layout::*, load_firmware, load_kernel,
 };
 
 /// Module for x86_64 related functionality.

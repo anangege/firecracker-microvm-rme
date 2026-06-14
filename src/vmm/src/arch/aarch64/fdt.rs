@@ -65,6 +65,9 @@ pub enum FdtError {
 
 #[allow(clippy::too_many_arguments)]
 /// Creates the flattened device tree for this aarch64 microVM.
+///
+/// When `realm` is true, non-deterministic elements (such as `rng-seed`) are omitted
+/// from the DTB to ensure deterministic measurement for ARM CCA RME attestation.
 pub fn create_fdt(
     guest_mem: &GuestMemoryMmap,
     vcpu_mpidr: Vec<u64>,
@@ -72,6 +75,7 @@ pub fn create_fdt(
     device_manager: &DeviceManager,
     gic_device: &GICDevice,
     initrd: &Option<InitrdConfig>,
+    realm: bool,
 ) -> Result<Vec<u8>, FdtError> {
     // Allocate stuff necessary for storing the blob.
     let mut fdt_writer = FdtWriter::new()?;
@@ -92,7 +96,7 @@ pub fn create_fdt(
     fdt_writer.property_u32("interrupt-parent", GIC_PHANDLE)?;
     create_cpu_nodes(&mut fdt_writer, &vcpu_mpidr)?;
     create_memory_node(&mut fdt_writer, guest_mem)?;
-    create_chosen_node(&mut fdt_writer, cmdline, initrd)?;
+    create_chosen_node(&mut fdt_writer, cmdline, initrd, realm)?;
     create_gic_node(&mut fdt_writer, gic_device)?;
     create_timer_node(&mut fdt_writer)?;
     create_clock_node(&mut fdt_writer)?;
@@ -256,6 +260,7 @@ fn create_chosen_node(
     fdt: &mut FdtWriter,
     cmdline: CString,
     initrd: &Option<InitrdConfig>,
+    realm: bool,
 ) -> Result<(), FdtError> {
     let chosen = fdt.begin_node("chosen")?;
     // Workaround to be able to reuse an existing property_*() method; in property_string() method,
@@ -277,9 +282,13 @@ fn create_chosen_node(
     // https://elixir.bootlin.com/linux/v6.19.8/source/drivers/pci/of.c#L255
     fdt.property_u32("linux,pci-probe-only", 1)?;
 
-    let mut rng_seed = [0u8; 64];
-    rand::fill(&mut rng_seed).expect("could not generate rng-seed");
-    fdt.property("rng-seed", &rng_seed)?;
+    // Skip rng-seed for realm VMs: the DTB is part of the realm initial measurement,
+    // so it must be fully deterministic. Adding random data would break attestation.
+    if !realm {
+        let mut rng_seed = [0u8; 64];
+        rand::fill(&mut rng_seed).expect("could not generate rng-seed");
+        fdt.property("rng-seed", &rng_seed)?;
+    }
 
     fdt.end_node(chosen)?;
 
@@ -609,6 +618,7 @@ mod tests {
             &device_manager,
             &gic,
             &Some(initrd),
+            false,
         )
         .unwrap();
         let generated_fdt = device_tree::DeviceTree::load(&dtb_bytes).unwrap();
