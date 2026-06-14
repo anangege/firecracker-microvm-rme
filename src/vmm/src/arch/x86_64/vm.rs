@@ -70,7 +70,7 @@ pub struct KvmVm {
 impl KvmVm {
     /// Create a new `KvmVm` struct.
     pub fn new(kvm: Kvm) -> Result<KvmVm, VmError> {
-        let common = Self::create_common(kvm)?;
+        let common = Self::create_common(kvm, None)?;
         let msrs_to_save = common
             .kvm
             .msrs_to_save()

@@ -136,8 +136,15 @@ impl Vm {
 
 /// Contains KvmVm functions that are usable across CPU architectures
 impl KvmVm {
-    /// Create a KVM VM
-    pub fn create_common(kvm: Kvm) -> Result<VmCommon, VmError> {
+    /// Create a KVM VM.
+    ///
+    /// # Arguments
+    ///
+    /// * `kvm` - The KVM instance to create the VM from.
+    /// * `realm_vm_type` - When `Some(vm_type)`, creates a Realm VM by passing
+    ///   `ipa_size | vm_type` to `KVM_CREATE_VM`. When `None`, creates a normal VM.
+    ///   On aarch64, use `KVM_VM_TYPE_ARM_REALM` for confidential VMs.
+    pub fn create_common(kvm: Kvm, realm_vm_type: Option<u64>) -> Result<VmCommon, VmError> {
         // It is known that KVM_CREATE_VM occasionally fails with EINTR on heavily loaded machines
         // with many VMs.
         //
@@ -161,7 +168,30 @@ impl KvmVm {
         const MAX_ATTEMPTS: u32 = 5;
         let mut attempt = 1;
         let fd = loop {
-            match kvm.fd.create_vm() {
+            let create_result = match realm_vm_type {
+                Some(vm_type) => {
+                    // For realm VMs on aarch64, compute the IPA size and OR it with
+                    // the realm type flag. On other architectures, just pass the type.
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        let mut ipa_size = 0u64;
+                        if kvm.fd.check_extension(kvm_ioctls::Cap::ArmVmIPASize) {
+                            #[allow(clippy::cast_sign_loss)]
+                            {
+                                ipa_size = kvm.fd.get_host_ipa_limit() as u64;
+                            }
+                        }
+                        kvm.fd.create_vm_with_type(ipa_size | vm_type)
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        kvm.fd.create_vm_with_type(vm_type)
+                    }
+                }
+                None => kvm.fd.create_vm(),
+            };
+
+            match create_result {
                 Ok(fd) => break fd,
                 Err(e) if e.errno() == libc::EINTR && attempt < MAX_ATTEMPTS => {
                     info!("Attempt #{attempt} of KVM_CREATE_VM returned EINTR");

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Kvm;
 use crate::arch::aarch64::gic::GicState;
+use crate::arch::aarch64::realm::{KVM_VM_TYPE_ARM_REALM, RealmManager};
 use crate::vstate::memory::{GuestMemoryExtension, GuestMemoryState};
 use crate::vstate::resources::ResourceAllocator;
 use crate::vstate::vm::{VmCommon, VmError};
@@ -18,6 +19,8 @@ pub struct KvmVm {
     pub common: VmCommon,
     // On aarch64 we need to keep around the fd obtained by creating the VGIC device.
     irqchip_handle: Option<crate::arch::aarch64::gic::GICDevice>,
+    /// Realm manager for ARM CCA RME confidential VMs. `None` for normal VMs.
+    realm_manager: Option<RealmManager>,
 }
 
 /// Error type for [`KvmVm::restore_state`]
@@ -34,11 +37,35 @@ pub enum KvmVmError {
 impl KvmVm {
     /// Create a new `KvmVm` struct.
     pub fn new(kvm: Kvm) -> Result<KvmVm, VmError> {
-        let common = Self::create_common(kvm)?;
+        let common = Self::create_common(kvm, None)?;
         Ok(KvmVm {
             common,
             irqchip_handle: None,
+            realm_manager: None,
         })
+    }
+
+    /// Create a new Realm `KvmVm` for ARM CCA RME confidential VMs.
+    ///
+    /// The VM is created with `KVM_VM_TYPE_ARM_REALM` flag, and the provided
+    /// `RealmManager` is stored for later realm lifecycle management.
+    pub fn new_realm(kvm: Kvm, realm_manager: RealmManager) -> Result<KvmVm, VmError> {
+        let common = Self::create_common(kvm, Some(KVM_VM_TYPE_ARM_REALM))?;
+        Ok(KvmVm {
+            common,
+            irqchip_handle: None,
+            realm_manager: Some(realm_manager),
+        })
+    }
+
+    /// Returns `true` if this is an ARM CCA RME Realm VM.
+    pub fn is_realm(&self) -> bool {
+        self.realm_manager.is_some()
+    }
+
+    /// Returns a reference to the [`RealmManager`], if this is a Realm VM.
+    pub fn realm_manager(&self) -> Option<&RealmManager> {
+        self.realm_manager.as_ref()
     }
 
     /// Pre-vCPU creation setup.
