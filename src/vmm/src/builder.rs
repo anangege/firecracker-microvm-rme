@@ -127,6 +127,9 @@ pub enum StartMicrovmError {
     VcpuFdCloneError(#[from] crate::vstate::vcpu::CopyKvmFdError),
     /// Error with the KvmVm object: {0}
     KvmVm(#[from] VmError),
+    /// ARM CCA RME realm error: {0}
+    #[cfg(target_arch = "aarch64")]
+    Realm(#[from] crate::arch::aarch64::realm::RealmError),
 }
 
 /// It's convenient to automatically convert `linux_loader::cmdline::Error`s
@@ -304,6 +307,24 @@ pub fn build_microvm_for_boot(
         warn!("Vcpus do not support pvtime, steal time will not be reported to guest");
     }
 
+    #[cfg(target_arch = "aarch64")]
+    let realm_enabled = vm_resources.machine_config.is_realm();
+
+    #[cfg(target_arch = "aarch64")]
+    configure_system_for_boot(
+        kvm_vm.kvm(),
+        &kvm_vm,
+        &mut device_manager,
+        vcpus.as_mut(),
+        &vm_resources.machine_config,
+        &cpu_template,
+        entry_point,
+        &initrd,
+        boot_cmdline,
+        realm_enabled,
+    )?;
+
+    #[cfg(not(target_arch = "aarch64"))]
     configure_system_for_boot(
         kvm_vm.kvm(),
         &kvm_vm,
@@ -315,6 +336,81 @@ pub fn build_microvm_for_boot(
         &initrd,
         boot_cmdline,
     )?;
+
+    // ARM CCA RME realm lifecycle: configure, create, populate, and activate the realm
+    // after all images are loaded and vCPUs are configured.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(realm_config) = vm_resources.machine_config.realm.as_ref().filter(|r| r.enabled) {
+        use std::os::unix::fs::MetadataExt;
+        use crate::arch::aarch64::realm::{
+            RealmConfig as RealmKvmConfig, RealmManager, MeasurementAlgo as RealmAlgo,
+        };
+        use base64::Engine;
+
+        let algo = match realm_config.measurement_algo {
+            crate::vmm_config::machine_config::MeasurementAlgo::Sha512 => RealmAlgo::Sha512,
+            crate::vmm_config::machine_config::MeasurementAlgo::Sha256 => RealmAlgo::Sha256,
+        };
+        let rpv = realm_config.personalization_value.as_ref().and_then(|s| {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(s).ok()?;
+            if bytes.len() == 64 {
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(&bytes);
+                Some(arr)
+            } else {
+                None
+            }
+        });
+        let realm_kvm_config = RealmKvmConfig {
+            measurement_algo: algo,
+            personalization_value: rpv,
+        };
+        let realm_manager = RealmManager::new(realm_kvm_config);
+
+        realm_manager.configure(kvm_vm.fd())?;
+        realm_manager.create_realm(kvm_vm.fd())?;
+
+        // Initialize RIPAS for the main RAM region.
+        let guest_memory = kvm_vm.guest_memory();
+        for region in guest_memory.iter() {
+            if region.region_type == crate::vstate::memory::GuestRegionType::Dram {
+                let base = region.start_addr().raw_value();
+                let size = region.len();
+                realm_manager.init_ripas(kvm_vm.fd(), base, size as u64)?;
+            }
+        }
+
+        // Populate kernel region (measured into RIM).
+        let kernel_start = crate::arch::get_kernel_start();
+        let kernel_file_size = boot_config
+            .kernel_file
+            .metadata()
+            .map(|m| m.size() as u64)
+            .unwrap_or(0);
+        let kernel_size = crate::utils::align_up(kernel_file_size, crate::arch::GUEST_PAGE_SIZE as u64);
+        realm_manager.populate(kvm_vm.fd(), kernel_start, kernel_size, true)?;
+
+        // Populate initrd region (measured into RIM).
+        if let Some(ref initrd_config) = initrd {
+            let initrd_size = crate::utils::align_up(
+                initrd_config.size as u64,
+                crate::arch::GUEST_PAGE_SIZE as u64,
+            );
+            realm_manager.populate(
+                kvm_vm.fd(),
+                initrd_config.address.raw_value(),
+                initrd_size,
+                true,
+            )?;
+        }
+
+        // Finalize each vCPU as a REC (Realm Execution Context).
+        for vcpu in vcpus.iter() {
+            realm_manager.finalize_vcpu(&vcpu.kvm_vcpu.fd)?;
+        }
+
+        realm_manager.activate(kvm_vm.fd())?;
+    }
 
     let vmm = Vmm {
         instance_info: instance_info.clone(),

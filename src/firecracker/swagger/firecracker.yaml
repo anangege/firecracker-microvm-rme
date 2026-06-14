@@ -1444,6 +1444,36 @@ definitions:
           - None
           - 2M
         description: Which huge pages configuration (if any) should be used to back guest memory.
+      realm:
+        $ref: "#/definitions/RealmConfig"
+
+  RealmConfig:
+    type: object
+    description:
+      Configuration for ARM CCA RME (Realm Management Extension) confidential VMs.
+      When enabled, the microVM runs as a Realm VM with memory and CPU state protected
+      from the hypervisor. Realm VMs do not support snapshot/restore or migration.
+      Only available on aarch64 hosts with CCA RME support.
+    required:
+      - enabled
+    properties:
+      enabled:
+        type: boolean
+        description: Whether realm mode is enabled for this microVM.
+      personalization_value:
+        type: string
+        description:
+          Realm Personalization Value (RPV), base64-encoded 64 bytes.
+          Used to bind the realm to a specific identity. If not provided,
+          a zero-filled RPV is used.
+      measurement_algo:
+        type: string
+        enum:
+          - Sha512
+          - Sha256
+        default: Sha512
+        description:
+          Measurement hash algorithm for computing the Realm Initial Measurement (RIM).
 
   MemoryBackend:
     type: object

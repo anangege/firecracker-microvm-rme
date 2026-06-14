@@ -8,6 +8,34 @@ use crate::cpu_config::templates::{CpuTemplateType, CustomCpuTemplate, StaticCpu
 
 /// The default memory size of the VM, in MiB.
 pub const DEFAULT_MEM_SIZE_MIB: usize = 128;
+
+/// Measurement hash algorithm used for realm initial measurement (RIM).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeasurementAlgo {
+    /// SHA-512 hash algorithm (default).
+    #[default]
+    Sha512,
+    /// SHA-256 hash algorithm.
+    Sha256,
+}
+
+/// Configuration for ARM CCA RME (Realm Management Extension) confidential VMs.
+///
+/// When enabled, the microVM is created as a Realm VM with memory and CPU state
+/// protected from the hypervisor. Realm VMs do not support snapshot/restore or migration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmConfig {
+    /// Whether realm mode is enabled for this microVM.
+    pub enabled: bool,
+    /// Realm Personalization Value (RPV), base64-encoded 64 bytes.
+    /// Used to bind the realm to a specific identity. If not provided, a zero-filled
+    /// RPV is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personalization_value: Option<String>,
+    /// Measurement hash algorithm for computing the Realm Initial Measurement (RIM).
+    #[serde(default)]
+    pub measurement_algo: MeasurementAlgo,
+}
 /// Firecracker aims to support small scale workloads only, so limit the maximum
 /// vCPUs supported.
 pub const MAX_SUPPORTED_VCPUS: u8 = 32;
@@ -113,6 +141,11 @@ pub struct MachineConfig {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: HugePageConfig,
+    /// ARM CCA RME realm configuration. When set and enabled, the microVM runs as a
+    /// confidential Realm VM. Only available on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm: Option<RealmConfig>,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,6 +188,8 @@ impl Default for MachineConfig {
             cpu_template: None,
             track_dirty_pages: false,
             huge_pages: HugePageConfig::None,
+            #[cfg(target_arch = "aarch64")]
+            realm: None,
             #[cfg(feature = "gdb")]
             gdb_socket_path: None,
         }
@@ -188,6 +223,10 @@ pub struct MachineConfigUpdate {
     /// Configures what page size Firecracker should use to back guest memory.
     #[serde(default)]
     pub huge_pages: Option<HugePageConfig>,
+    /// ARM CCA RME realm configuration.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(default)]
+    pub realm: Option<RealmConfig>,
     /// GDB socket address.
     #[cfg(feature = "gdb")]
     #[serde(default)]
@@ -212,6 +251,8 @@ impl From<MachineConfig> for MachineConfigUpdate {
             cpu_template: cfg.static_template(),
             track_dirty_pages: Some(cfg.track_dirty_pages),
             huge_pages: Some(cfg.huge_pages),
+            #[cfg(target_arch = "aarch64")]
+            realm: cfg.realm,
             #[cfg(feature = "gdb")]
             gdb_socket_path: cfg.gdb_socket_path,
         }
@@ -222,6 +263,12 @@ impl MachineConfig {
     /// Sets cpu tempalte field to `CpuTemplateType::Custom(cpu_template)`.
     pub fn set_custom_cpu_template(&mut self, cpu_template: CustomCpuTemplate) {
         self.cpu_template = Some(CpuTemplateType::Custom(cpu_template));
+    }
+
+    /// Returns `true` if this machine is configured as an ARM CCA RME realm VM.
+    #[cfg(target_arch = "aarch64")]
+    pub fn is_realm(&self) -> bool {
+        self.realm.as_ref().is_some_and(|r| r.enabled)
     }
 
     fn static_template(&self) -> Option<StaticCpuTemplate> {
@@ -279,6 +326,8 @@ impl MachineConfig {
             cpu_template,
             track_dirty_pages: update.track_dirty_pages.unwrap_or(self.track_dirty_pages),
             huge_pages: page_config,
+            #[cfg(target_arch = "aarch64")]
+            realm: update.realm.clone().or_else(|| self.realm.clone()),
             #[cfg(feature = "gdb")]
             gdb_socket_path: update.gdb_socket_path.clone(),
         })
